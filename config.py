@@ -24,7 +24,7 @@ CHAT_MODEL = "gemini-2.5-flash"
 
 # Chunking
 CHUNK_SIZE = 2000      # characters per chunk
-CHUNK_OVERLAP = 2000    # overlap between chunks
+CHUNK_OVERLAP = 200  # overlap between chunks
 # Retrieval
 TOP_K = 6              # chunks per query
 MAX_HISTORY_TURNS = 6  # how many past turns to feed back
