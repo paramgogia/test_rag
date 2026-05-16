@@ -7,6 +7,7 @@ the index + chunk metadata to disk so ingestion only runs once.
 from __future__ import annotations
 import pickle
 import time
+import re
 from pathlib import Path
 from typing import List, Tuple
 
@@ -21,7 +22,7 @@ from document_loader import Chunk
 
 
 EMBEDDING_DIM = 768  # text-embedding-004 output dim
-EMBED_BATCH = 50     # safely below Gemini's 100/req limit
+EMBED_BATCH = 10   # safely below Gemini's 100/req limit
 
 
 def _ensure_api_key():
@@ -40,10 +41,12 @@ def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.n
     """
     _ensure_api_key()
     all_vectors = []
-    for i in range(0, len(texts), EMBED_BATCH):
+    total_batches = (len(texts) + EMBED_BATCH - 1) // EMBED_BATCH
+
+    for batch_idx, i in enumerate(range(0, len(texts), EMBED_BATCH), start=1):
         batch = texts[i:i + EMBED_BATCH]
-        # Retry with mild backoff for transient rate limits
-        for attempt in range(3):
+        # Retry loop with awareness of server-provided retry_delay
+        for attempt in range(5):
             try:
                 resp = genai.embed_content(
                     model=EMBEDDING_MODEL,
@@ -52,20 +55,36 @@ def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.n
                     output_dimensionality=EMBEDDING_DIM,
                 )
                 vecs = resp["embedding"]
-                # Some versions of the SDK return a list of lists, others a single list
                 if isinstance(vecs[0], (int, float)):
                     vecs = [vecs]
                 all_vectors.extend(vecs)
+                print(f"    Batch {batch_idx}/{total_batches} embedded ({len(all_vectors)}/{len(texts)} done)")
                 break
             except Exception as e:
-                if attempt == 2:
-                    raise
-                time.sleep(2 * (attempt + 1))
+                msg = str(e)
+                # Honour server-provided retry hint when rate-limited
+                wait = 35  # default backoff for 429
+                m = re.search(r"retry in ([\d.]+)s", msg, re.IGNORECASE)
+                if m:
+                    wait = float(m.group(1)) + 2
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower():
+                    if attempt == 4:
+                        raise
+                    print(f"    Rate-limited, waiting {wait:.0f}s before retry...")
+                    time.sleep(wait)
+                else:
+                    if attempt == 4:
+                        raise
+                    time.sleep(5 * (attempt + 1))
+
+        # Proactive pacing between batches: ~7 seconds keeps us safely
+        # under 100 texts/min at batch size 10
+        if batch_idx < total_batches:
+            time.sleep(7)
+
     arr = np.array(all_vectors, dtype="float32")
-    # L2-normalise for cosine similarity via inner product
     faiss.normalize_L2(arr)
     return arr
-
 
 class VectorStore:
     def __init__(self):
