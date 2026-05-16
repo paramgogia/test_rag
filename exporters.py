@@ -31,6 +31,42 @@ def _safe_filename(question: str) -> str:
     return f"{clean}_{ts}" if clean else f"answer_{ts}"
 
 
+def _split_table_row(line: str) -> List[str]:
+    """
+    Split a markdown table row on the `|` column separator while leaving
+    pipes that appear inside `[...]` citation tags alone. Without this,
+    a row like
+
+        | Revenue | $4,941M [Q1 FY26 Press Release | Page 1] |
+
+    would be split into 5 cells instead of 3, scattering the citation
+    across columns in the exported sheet.
+    """
+    parts: List[str] = []
+    buf = []
+    depth = 0
+    for ch in line:
+        if ch == "[":
+            depth += 1
+            buf.append(ch)
+        elif ch == "]":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+        elif ch == "|" and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    parts.append("".join(buf))
+    # Markdown tables typically have leading/trailing empty cells from
+    # the outer `|`s — drop those.
+    if parts and parts[0].strip() == "":
+        parts = parts[1:]
+    if parts and parts[-1].strip() == "":
+        parts = parts[:-1]
+    return [p.strip() for p in parts]
+
+
 def _extract_markdown_tables(text: str) -> List[List[List[str]]]:
     """Find markdown tables in the answer. Returns list of tables (each is list of rows)."""
     tables = []
@@ -41,11 +77,11 @@ def _extract_markdown_tables(text: str) -> List[List[List[str]]]:
         # markdown table: at least 2 pipes, next line is separator
         if line.count("|") >= 2 and i + 1 < len(lines) and re.match(r"^\s*\|?[\s\-:|]+\|?\s*$", lines[i + 1]):
             rows = []
-            header = [c.strip() for c in line.strip("|").split("|")]
+            header = _split_table_row(line)
             rows.append(header)
             j = i + 2
             while j < len(lines) and lines[j].count("|") >= 2:
-                row = [c.strip() for c in lines[j].strip("|").split("|")]
+                row = _split_table_row(lines[j])
                 # pad/truncate to header width
                 if len(row) < len(header):
                     row += [""] * (len(header) - len(row))
