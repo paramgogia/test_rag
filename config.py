@@ -17,16 +17,24 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 # Gemini API
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
-# Models
+LLM_PROVIDER = "ollama"
+
+# Gemini settings (used when LLM_PROVIDER = "gemini")
 EMBEDDING_MODEL = "models/gemini-embedding-001"
-EMBEDDING_DIM = 768          # request 768-dim output via MRL
+EMBEDDING_DIM = 768
 CHAT_MODEL = "gemini-2.5-flash"
+
+# Ollama settings (used when LLM_PROVIDER = "ollama")
+OLLAMA_HOST = "http://localhost:11434"
+OLLAMA_EMBEDDING_MODEL = "nomic-embed-text"
+OLLAMA_EMBEDDING_DIM = 768            # nomic-embed-text outputs 768 dims natively
+OLLAMA_CHAT_MODEL = "llama3.1:8b"     # change to match what you pulled
 
 # Chunking
 CHUNK_SIZE = 2000      # characters per chunk
 CHUNK_OVERLAP = 200  # overlap between chunks
 # Retrieval
-TOP_K = 6              # chunks per query
+TOP_K = 10             # chunks per query
 MAX_HISTORY_TURNS = 6  # how many past turns to feed back
 
 # Vector store filenames

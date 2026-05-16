@@ -1,30 +1,26 @@
 """
-Conversational RAG engine.
+Conversational RAG engine with pluggable LLM backend.
 
-Pipeline per user message:
-  1. Rewrite the question using chat history so follow-ups become standalone
-     queries ("how did it compare to Q2?" -> "How did Infosys Q3 FY26 revenue
-     compare to Q2 FY26?"). This is what makes follow-ups actually work.
-  2. Retrieve top-K chunks from the vector store.
-  3. Build a strict prompt that forces citation and admits unknowns.
-  4. Route the output: a separate small LLM call decides if the answer is
-     better delivered as markdown, PDF report, or Excel sheet.
+Switch backends via config.LLM_PROVIDER:
+- "ollama": local llama / qwen / etc via Ollama
+- "gemini": Google's Gemini API
 """
 from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Any
-
-import google.generativeai as genai
+from typing import List, Dict, Any, Iterator
 
 from config import (
-    GEMINI_API_KEY, CHAT_MODEL, TOP_K, MAX_HISTORY_TURNS
+    LLM_PROVIDER,
+    GEMINI_API_KEY, CHAT_MODEL,
+    OLLAMA_HOST, OLLAMA_CHAT_MODEL,
+    TOP_K, MAX_HISTORY_TURNS
 )
 from vector_store import VectorStore
 
 
-# ---------- Prompts ----------
+# ---------- Prompts (same as before) ----------
 
 QUESTION_REWRITER_PROMPT = """You rewrite follow-up questions into standalone questions.
 
@@ -58,8 +54,7 @@ Rules you MUST follow:
    matching one of the sources listed in the context, e.g. [Q1 FY26 Press
    Release | Page 7]. Multiple sources can be cited together.
 3. When the user asks for trends, comparisons, or multi-quarter analysis,
-   actively pull numbers from multiple chunks and reason about them. Do
-   not just list paragraphs.
+   actively pull numbers from multiple chunks and reason about them.
 4. Prefer clean structured output: tables for comparisons, bullet points
    for lists, short paragraphs for explanations. Use markdown.
 5. If numeric figures appear in different units (USD vs INR, millions vs
@@ -94,63 +89,105 @@ Answer preview (first 800 chars):
 {preview}
 
 Choose ONE format:
-- "markdown": short factual answers, single-quarter lookups, definitions,
-  simple comparisons that fit comfortably in a chat bubble.
-- "pdf": multi-section reports, executive summaries, analyses spanning
-  several quarters or topics, narrative-heavy answers, anything the user
-  would want to save and share.
-- "excel": data-heavy answers — multi-row tables, time-series data,
-  side-by-side numeric comparisons, anything that screams "spreadsheet".
+- "markdown": short factual answers, single-quarter lookups, definitions
+- "pdf": multi-section reports, executive summaries, narrative analyses
+- "excel": data-heavy answers, multi-row tables, time-series comparisons
 
-Respond with ONLY a JSON object: {{"format": "markdown"}} or
-{{"format": "pdf"}} or {{"format": "excel"}}. No other text."""
+Respond with ONLY a JSON object like: {{"format": "markdown"}}"""
+
+
+# ---------- Unified LLM caller ----------
+
+class LLMClient:
+    """Thin wrapper that calls either Gemini or Ollama transparently."""
+
+    def __init__(self):
+        self.provider = LLM_PROVIDER
+        if self.provider == "gemini":
+            import google.generativeai as genai
+            if not GEMINI_API_KEY:
+                raise RuntimeError("GEMINI_API_KEY not set in .env")
+            genai.configure(api_key=GEMINI_API_KEY)
+            self._gemini = genai.GenerativeModel(CHAT_MODEL)
+        elif self.provider == "ollama":
+            import ollama
+            self._ollama = ollama.Client(host=OLLAMA_HOST)
+        else:
+            raise ValueError(f"Unknown LLM_PROVIDER: {self.provider}")
+
+    def generate(self, prompt: str, temperature: float = 0.2) -> str:
+        if self.provider == "gemini":
+            resp = self._gemini.generate_content(
+                prompt,
+                generation_config={"temperature": temperature},
+            )
+            return (resp.text or "").strip()
+        else:  # ollama
+            resp = self._ollama.generate(
+                model=OLLAMA_CHAT_MODEL,
+                prompt=prompt,
+                options={"temperature": temperature},
+                keep_alive="30m",
+            )
+            return (resp.get("response") or "").strip()
+
+    def generate_stream(self, prompt: str, temperature: float = 0.2) -> Iterator[str]:
+        """Yield response tokens as they arrive from the LLM."""
+        if self.provider == "gemini":
+            resp = self._gemini.generate_content(
+                prompt,
+                generation_config={"temperature": temperature},
+                stream=True,
+            )
+            for chunk in resp:
+                text = getattr(chunk, "text", "") or ""
+                if text:
+                    yield text
+        else:  # ollama
+            for part in self._ollama.generate(
+                model=OLLAMA_CHAT_MODEL,
+                prompt=prompt,
+                options={"temperature": temperature},
+                keep_alive="30m",
+                stream=True,
+            ):
+                piece = part.get("response") or ""
+                if piece:
+                    yield piece
 
 
 # ---------- Engine ----------
 
 @dataclass
 class ChatTurn:
-    role: str    # "user" or "assistant"
+    role: str
     content: str
 
 
 @dataclass
 class RagAnswer:
-    answer: str                     # the markdown answer
-    sources: List[Dict[str, Any]]   # list of {source, location, snippet}
-    format: str                     # "markdown" | "pdf" | "excel"
-    rewritten_question: str         # for debugging / sample logs
+    answer: str
+    sources: List[Dict[str, Any]]
+    format: str
+    rewritten_question: str
 
 
 class RagEngine:
     def __init__(self, store: VectorStore):
-        if not GEMINI_API_KEY:
-            raise RuntimeError("GEMINI_API_KEY not set in .env")
-        genai.configure(api_key=GEMINI_API_KEY)
-        self.model = genai.GenerativeModel(CHAT_MODEL)
+        self.llm = LLMClient()
         self.store = store
         self.history: List[ChatTurn] = []
-
-    # ---------- public ----------
 
     def reset(self):
         self.history.clear()
 
     def ask(self, question: str) -> RagAnswer:
-        # 1. rewrite for follow-ups
         standalone = self._rewrite_question(question)
-
-        # 2. retrieve
         results = self.store.search(standalone, top_k=TOP_K)
         context_block, sources = self._format_context(results)
-
-        # 3. generate answer
         answer = self._generate_answer(question, standalone, context_block)
-
-        # 4. route output format
         fmt = self._route_format(standalone, answer)
 
-        # 5. update history
         self.history.append(ChatTurn("user", question))
         self.history.append(ChatTurn("assistant", answer))
         self.history = self.history[-2 * MAX_HISTORY_TURNS:]
@@ -161,6 +198,67 @@ class RagEngine:
             format=fmt,
             rewritten_question=standalone,
         )
+
+    def ask_stream(self, question: str) -> Iterator[tuple]:
+        """
+        Streamed variant of ask(). Yields events so the UI can show each
+        pipeline step as it happens, plus answer tokens as they arrive.
+
+        Event shapes:
+          ("step", {"name": <str>, "status": "start"|"done", ...payload})
+          ("token", {"text": <str>})
+          ("final", RagAnswer)
+        """
+        # 1. Question rewrite (only meaningful when there's prior history)
+        has_history = bool(self.history)
+        yield ("step", {"name": "rewrite", "status": "start",
+                        "has_history": has_history})
+        standalone = self._rewrite_question(question)
+        yield ("step", {"name": "rewrite", "status": "done",
+                        "standalone": standalone,
+                        "rewritten": has_history and standalone != question})
+
+        # 2. Retrieval
+        yield ("step", {"name": "retrieve", "status": "start", "top_k": TOP_K})
+        results = self.store.search(standalone, top_k=TOP_K)
+        context_block, sources = self._format_context(results)
+        yield ("step", {"name": "retrieve", "status": "done",
+                        "count": len(results), "sources": sources})
+
+        # 3. Answer generation (streamed)
+        yield ("step", {"name": "generate", "status": "start",
+                        "provider": self.llm.provider,
+                        "model": OLLAMA_CHAT_MODEL if self.llm.provider == "ollama" else CHAT_MODEL})
+        prompt = ANSWER_PROMPT.format(
+            system=SYSTEM_PROMPT,
+            context=context_block,
+            history=self._history_text(),
+            question=standalone,
+        )
+        parts: List[str] = []
+        for token in self.llm.generate_stream(prompt, temperature=0.2):
+            parts.append(token)
+            yield ("token", {"text": token})
+        answer = "".join(parts).strip()
+        yield ("step", {"name": "generate", "status": "done",
+                        "length": len(answer)})
+
+        # 4. Format routing (heuristic-only here for speed; UI shows it as a step)
+        yield ("step", {"name": "format", "status": "start"})
+        fmt = self._route_format_heuristic(standalone, answer)
+        yield ("step", {"name": "format", "status": "done", "format": fmt})
+
+        # 5. Persist history
+        self.history.append(ChatTurn("user", question))
+        self.history.append(ChatTurn("assistant", answer))
+        self.history = self.history[-2 * MAX_HISTORY_TURNS:]
+
+        yield ("final", RagAnswer(
+            answer=answer,
+            sources=sources,
+            format=fmt,
+            rewritten_question=standalone,
+        ))
 
     # ---------- internals ----------
 
@@ -177,11 +275,13 @@ class RagEngine:
             question=question,
         )
         try:
-            resp = self.model.generate_content(prompt)
-            rewritten = (resp.text or "").strip()
-            # safety: if model returned empty or absurd, fall back
+            rewritten = self.llm.generate(prompt, temperature=0.0).strip()
             if not rewritten or len(rewritten) > 500:
                 return question
+            # Strip common LLM preambles
+            for prefix in ("Standalone question:", "Rewritten question:", "Question:"):
+                if rewritten.lower().startswith(prefix.lower()):
+                    rewritten = rewritten[len(prefix):].strip()
             return rewritten
         except Exception:
             return question
@@ -210,36 +310,36 @@ class RagEngine:
             history=self._history_text(),
             question=standalone,
         )
-        resp = self.model.generate_content(prompt)
-        return (resp.text or "").strip()
+        return self.llm.generate(prompt, temperature=0.2)
 
-    def _route_format(self, question: str, answer: str) -> str:
-        # Fast heuristics first — saves an API call most of the time.
+    def _route_format_heuristic(self, question: str, answer: str) -> str:
+        """Decide output format from keywords + answer shape. No extra LLM call."""
         q_lower = question.lower()
         if any(k in q_lower for k in ["report", "summary", "summarise", "summarize", "overview", "pdf"]):
             return "pdf"
         if any(k in q_lower for k in ["excel", "spreadsheet", "table of", "export", "download"]):
             return "excel"
-        # Detect markdown table in answer => likely tabular
         if answer.count("|") > 12 and "---" in answer:
             return "excel"
         if len(answer) > 1500:
             return "pdf"
+        return "markdown"
 
-        # Otherwise ask the router LLM
-        prompt = FORMAT_ROUTER_PROMPT.format(
-            question=question, preview=answer[:800]
-        )
+    def _route_format(self, question: str, answer: str) -> str:
+        """Heuristic format routing with an LLM tie-breaker for ambiguous cases."""
+        fmt = self._route_format_heuristic(question, answer)
+        if fmt != "markdown":
+            return fmt
+
+        prompt = FORMAT_ROUTER_PROMPT.format(question=question, preview=answer[:800])
         try:
-            resp = self.model.generate_content(prompt)
-            text = (resp.text or "").strip()
-            # tolerant JSON parse
+            text = self.llm.generate(prompt, temperature=0.0)
             match = re.search(r'\{.*?\}', text, re.DOTALL)
             if match:
                 data = json.loads(match.group(0))
-                fmt = data.get("format", "markdown").lower()
-                if fmt in {"markdown", "pdf", "excel"}:
-                    return fmt
+                f = data.get("format", "markdown").lower()
+                if f in {"markdown", "pdf", "excel"}:
+                    return f
         except Exception:
             pass
         return "markdown"

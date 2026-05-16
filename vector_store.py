@@ -1,51 +1,55 @@
 """
-FAISS-backed vector store, with embeddings from Gemini's text-embedding-004.
+FAISS-backed vector store with pluggable embeddings.
 
-We batch embedding requests (Gemini allows up to 100 per call) and persist
-the index + chunk metadata to disk so ingestion only runs once.
+Supports two providers, chosen via config.LLM_PROVIDER:
+- "gemini": Google's gemini-embedding-001 (cloud, subject to free-tier quotas)
+- "ollama": nomic-embed-text running locally (no quotas, fully offline)
 """
 from __future__ import annotations
 import pickle
-import time
 import re
+import time
 from pathlib import Path
 from typing import List, Tuple
 
 import faiss
 import numpy as np
-import google.generativeai as genai
 
 from config import (
-    EMBEDDING_MODEL, FAISS_INDEX_PATH, METADATA_PATH, GEMINI_API_KEY, EMBEDDING_DIM
+    LLM_PROVIDER,
+    EMBEDDING_MODEL, EMBEDDING_DIM,
+    OLLAMA_HOST, OLLAMA_EMBEDDING_MODEL, OLLAMA_EMBEDDING_DIM,
+    FAISS_INDEX_PATH, METADATA_PATH, GEMINI_API_KEY
 )
 from document_loader import Chunk
 
 
-EMBEDDING_DIM = 768  # text-embedding-004 output dim
-EMBED_BATCH = 10   # safely below Gemini's 100/req limit
+# Pick embedding dim based on provider
+if LLM_PROVIDER == "ollama":
+    ACTIVE_EMBEDDING_DIM = OLLAMA_EMBEDDING_DIM
+else:
+    ACTIVE_EMBEDDING_DIM = EMBEDDING_DIM
+
+EMBED_BATCH = 32  # tuned for local; bumped up since there's no quota
+# nomic-embed-text has an 8k token window but Ollama's default num_ctx is 2048.
+# ~4000 chars stays comfortably under 1024 tokens for any input.
+OLLAMA_EMBED_MAX_CHARS = 4000
 
 
-def _ensure_api_key():
+# ---------- Provider-specific embedding functions ----------
+
+def _embed_gemini(texts: List[str], task_type: str) -> List[List[float]]:
+    import google.generativeai as genai
     if not GEMINI_API_KEY:
         raise RuntimeError(
-            "GEMINI_API_KEY not set. Copy .env.example to .env and add your key."
+            "GEMINI_API_KEY not set. Either set it in .env or switch "
+            "LLM_PROVIDER to 'ollama' in config.py."
         )
     genai.configure(api_key=GEMINI_API_KEY)
 
-
-def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
-    """
-    Embed a list of texts. task_type="RETRIEVAL_DOCUMENT" for ingestion,
-    "RETRIEVAL_QUERY" at query time -- Gemini optimises the vectors
-    differently for each.
-    """
-    _ensure_api_key()
     all_vectors = []
-    total_batches = (len(texts) + EMBED_BATCH - 1) // EMBED_BATCH
-
-    for batch_idx, i in enumerate(range(0, len(texts), EMBED_BATCH), start=1):
-        batch = texts[i:i + EMBED_BATCH]
-        # Retry loop with awareness of server-provided retry_delay
+    for i in range(0, len(texts), 10):  # smaller batch for Gemini rate limits
+        batch = texts[i:i + 10]
         for attempt in range(5):
             try:
                 resp = genai.embed_content(
@@ -58,40 +62,139 @@ def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.n
                 if isinstance(vecs[0], (int, float)):
                     vecs = [vecs]
                 all_vectors.extend(vecs)
-                print(f"    Batch {batch_idx}/{total_batches} embedded ({len(all_vectors)}/{len(texts)} done)")
                 break
             except Exception as e:
                 msg = str(e)
-                # Honour server-provided retry hint when rate-limited
-                wait = 35  # default backoff for 429
+                wait = 35
                 m = re.search(r"retry in ([\d.]+)s", msg, re.IGNORECASE)
                 if m:
                     wait = float(m.group(1)) + 2
-                if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower():
+                if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
                     if attempt == 4:
                         raise
-                    print(f"    Rate-limited, waiting {wait:.0f}s before retry...")
+                    print(f"    Rate-limited, waiting {wait:.0f}s...")
                     time.sleep(wait)
                 else:
                     if attempt == 4:
                         raise
                     time.sleep(5 * (attempt + 1))
-
-        # Proactive pacing between batches: ~7 seconds keeps us safely
-        # under 100 texts/min at batch size 10
-        if batch_idx < total_batches:
+        if i + 10 < len(texts):
             time.sleep(7)
+    return all_vectors
+
+
+def _ollama_embed_call(client, inputs: List[str]) -> List[List[float]]:
+    """One embed call with explicit truncation, returning a list of vectors."""
+    resp = client.embed(
+        model=OLLAMA_EMBEDDING_MODEL,
+        input=inputs,
+        truncate=True,
+    )
+    vecs = resp.get("embeddings") or resp.get("embedding")
+    if vecs is None:
+        raise RuntimeError(f"Unexpected Ollama response: {resp}")
+    if isinstance(vecs[0], (int, float)):
+        vecs = [vecs]
+    return vecs
+
+
+def _embed_ollama(texts: List[str], _task_type: str) -> List[List[float]]:
+    """
+    Embed using a local Ollama server. The Ollama embed endpoint can take
+    a list of inputs in one call, which makes it nicely batch-friendly.
+
+    Safeguards:
+    - Pre-truncate each input to OLLAMA_EMBED_MAX_CHARS so a single oversize
+      chunk can't blow the embedder's context window.
+    - On a batch failure, retry each item individually so one bad input does
+      not poison the whole batch.
+    """
+    import ollama
+    client = ollama.Client(host=OLLAMA_HOST)
+
+    # Pre-truncate every text once; embedding doesn't need the full chunk,
+    # and nomic-embed-text's effective context is small.
+    safe_texts = [t[:OLLAMA_EMBED_MAX_CHARS] for t in texts]
+
+    all_vectors: List[List[float]] = []
+    for i in range(0, len(safe_texts), EMBED_BATCH):
+        batch = safe_texts[i:i + EMBED_BATCH]
+        vecs = None
+        last_err: Exception | None = None
+        for attempt in range(3):
+            try:
+                vecs = _ollama_embed_call(client, batch)
+                break
+            except Exception as e:
+                last_err = e
+                time.sleep(1.5 * (attempt + 1))
+
+        if vecs is None:
+            # Batch failed repeatedly — fall back to one-by-one with aggressive
+            # truncation, so a single oversize input can't sink the whole run.
+            print(f"    batch {i}-{i + len(batch)} failed ({last_err}); "
+                  f"retrying inputs individually")
+            vecs = []
+            for j, item in enumerate(batch):
+                item_text = item
+                ok = False
+                for shrink in (1.0, 0.5, 0.25):
+                    trimmed = item_text[: max(200, int(OLLAMA_EMBED_MAX_CHARS * shrink))]
+                    try:
+                        vecs.extend(_ollama_embed_call(client, [trimmed]))
+                        ok = True
+                        break
+                    except Exception as e:
+                        last_err = e
+                        time.sleep(1.0)
+                if not ok:
+                    raise RuntimeError(
+                        f"Ollama embedding failed on chunk {i + j} even after "
+                        f"truncation. Is the Ollama app running and is "
+                        f"'{OLLAMA_EMBEDDING_MODEL}' pulled? "
+                        f"Run: ollama pull {OLLAMA_EMBEDDING_MODEL}\n"
+                        f"Original error: {last_err}"
+                    )
+
+        all_vectors.extend(vecs)
+        done = min(i + EMBED_BATCH, len(safe_texts))
+        print(f"    {done}/{len(safe_texts)} embedded")
+    return all_vectors
+
+
+def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> np.ndarray:
+    """
+    Top-level embedding entry point. Routes to the configured provider,
+    L2-normalises the resulting vectors so FAISS inner-product == cosine.
+    """
+    if not texts:
+        return np.zeros((0, ACTIVE_EMBEDDING_DIM), dtype="float32")
+
+    if LLM_PROVIDER == "ollama":
+        all_vectors = _embed_ollama(texts, task_type)
+    elif LLM_PROVIDER == "gemini":
+        all_vectors = _embed_gemini(texts, task_type)
+    else:
+        raise ValueError(f"Unknown LLM_PROVIDER: {LLM_PROVIDER}")
 
     arr = np.array(all_vectors, dtype="float32")
+    if arr.shape[1] != ACTIVE_EMBEDDING_DIM:
+        raise RuntimeError(
+            f"Embedding dim mismatch: model returned {arr.shape[1]}, "
+            f"config expects {ACTIVE_EMBEDDING_DIM}. "
+            f"Update {('OLLAMA_EMBEDDING_DIM' if LLM_PROVIDER == 'ollama' else 'EMBEDDING_DIM')} in config.py."
+        )
     faiss.normalize_L2(arr)
     return arr
+
+
+# ---------- Vector store class (unchanged interface) ----------
 
 class VectorStore:
     def __init__(self):
         self.index: faiss.IndexFlatIP | None = None
         self.chunks: List[Chunk] = []
 
-    # ----- persistence -----
     def save(self):
         faiss.write_index(self.index, str(FAISS_INDEX_PATH))
         with open(METADATA_PATH, "wb") as f:
@@ -106,15 +209,14 @@ class VectorStore:
         self.chunks = [Chunk(**d) for d in data]
         return True
 
-    # ----- build -----
     def build(self, chunks: List[Chunk]):
         if not chunks:
             raise ValueError("No chunks to index.")
-        print(f"  Embedding {len(chunks)} chunks (in batches of {EMBED_BATCH})...")
+        print(f"  Embedding {len(chunks)} chunks via {LLM_PROVIDER}...")
         texts = [c.text for c in chunks]
         vectors = embed_texts(texts, task_type="RETRIEVAL_DOCUMENT")
 
-        self.index = faiss.IndexFlatIP(EMBEDDING_DIM)
+        self.index = faiss.IndexFlatIP(ACTIVE_EMBEDDING_DIM)
         self.index.add(vectors)
         self.chunks = chunks
         for i, c in enumerate(self.chunks):
@@ -122,15 +224,38 @@ class VectorStore:
         self.save()
         print(f"  Vector store built. Total vectors: {self.index.ntotal}")
 
-    # ----- search -----
     def search(self, query: str, top_k: int = 6) -> List[Tuple[Chunk, float]]:
+        """
+        Retrieve top-k chunks for the query.
+
+        To stop the much-larger Annual Report from drowning out short
+        press releases / sheets in pure cosine ranking, we:
+        1. Pull a wider candidate pool (4x top_k) from FAISS.
+        2. Boost candidates whose source name matches tokens in the query
+           (e.g. "Q1 FY26" in the query lifts "Q1 FY26 Press Release").
+        3. Re-rank by boosted score and return top_k.
+        """
         if self.index is None:
             raise RuntimeError("Vector store not loaded. Run ingest.py first.")
         q_vec = embed_texts([query], task_type="RETRIEVAL_QUERY")
-        scores, idxs = self.index.search(q_vec, top_k)
-        results = []
+
+        pool = min(max(top_k * 4, top_k + 10), self.index.ntotal)
+        scores, idxs = self.index.search(q_vec, pool)
+
+        q_tokens = {t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) >= 2}
+
+        rescored: List[Tuple[Chunk, float]] = []
         for score, idx in zip(scores[0], idxs[0]):
             if idx == -1:
                 continue
-            results.append((self.chunks[idx], float(score)))
-        return results
+            chunk = self.chunks[idx]
+            meta = f"{chunk.source} {chunk.location}".lower()
+            meta_tokens = set(re.findall(r"[a-z0-9]+", meta))
+            overlap = len(q_tokens & meta_tokens)
+            # Small boost per overlapping token, capped so it can re-rank close
+            # scores (gap is typically <0.05) without overwhelming similarity.
+            boost = min(0.04 * overlap, 0.12)
+            rescored.append((chunk, float(score) + boost))
+
+        rescored.sort(key=lambda x: x[1], reverse=True)
+        return rescored[:top_k]
