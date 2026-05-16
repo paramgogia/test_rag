@@ -9,3 +9,4 @@ outputs/*.xlsx
 venv/
 .DS_Store
 .streamlit/secrets.toml
+data/

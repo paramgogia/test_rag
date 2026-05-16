@@ -18,8 +18,9 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # Models
-EMBEDDING_MODEL = "models/text-embedding-004"
-CHAT_MODEL = "gemini-2.0-flash"
+EMBEDDING_MODEL = "models/gemini-embedding-001"
+EMBEDDING_DIM = 768          # request 768-dim output via MRL
+CHAT_MODEL = "gemini-2.5-flash"
 
 # Chunking
 CHUNK_SIZE = 1000      # characters per chunk
