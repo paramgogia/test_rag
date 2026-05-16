@@ -200,7 +200,9 @@ class RagEngine:
         results = self.store.search(standalone, top_k=TOP_K)
         context_block, sources = self._format_context(results)
         answer = self._generate_answer(standalone, context_block)
-        fmt = self._route_format(standalone, answer)
+        # Route format off the *original* question — the user's "table of",
+        # "summary", "report" hints are stripped by the standalone rewriter.
+        fmt = self._route_format(question, answer)
 
         self.history.append(ChatTurn("user", question))
         self.history.append(ChatTurn("assistant", answer))
@@ -258,8 +260,9 @@ class RagEngine:
                         "length": len(answer)})
 
         # 4. Format routing (heuristic-only here for speed; UI shows it as a step)
+        # Use the original question — the standalone rewriter strips format hints.
         yield ("step", {"name": "format", "status": "start"})
-        fmt = self._route_format_heuristic(standalone, answer)
+        fmt = self._route_format_heuristic(question, answer)
         yield ("step", {"name": "format", "status": "done", "format": fmt})
 
         # 5. Persist history
