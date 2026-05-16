@@ -6,7 +6,6 @@ Switch backends via config.LLM_PROVIDER:
 - "gemini": Google's Gemini API
 """
 from __future__ import annotations
-import json
 import re
 from dataclasses import dataclass
 from typing import List, Dict, Any, Iterator
@@ -61,6 +60,15 @@ Rules you MUST follow:
    crores), state the unit explicitly.
 6. Never speculate beyond the documents. Do not give investment advice.
 
+IMPORTANT — file generation:
+PDF and Excel files are produced AUTOMATICALLY by the surrounding Python
+application after you respond. You only need to supply the content in the
+right shape; you must NEVER say things like "I cannot generate a PDF",
+"I am unable to create an Excel file", "I don't have the ability to
+produce downloadable files", or any similar refusal. The download is
+handled for you. Just write the answer — a downloadable file will be
+attached to the chat automatically.
+
 You are talking to someone who understands finance. Be precise, concise,
 and analyst-grade."""
 
@@ -82,6 +90,9 @@ Chat history (for tone and continuity, not as a source of facts):
 
 User question: {question}
 
+Output format requested by the system: {format_hint}
+{format_directive}
+
 Instructions:
 - Quote specific numbers, percentages, and dates directly from the excerpts
   above. Do NOT round or paraphrase numerical values.
@@ -91,16 +102,40 @@ Instructions:
   the most specific (e.g. a press release for a quarterly number).
 - Only say "the answer is not in the documents" if NO excerpt above
   mentions the topic at all.
+- Do NOT refuse to "generate a PDF" or "generate an Excel" — file
+  rendering is done by the application after your response. Just write
+  the content.
 
 Write the analyst-grade answer below."""
 
 
-FORMAT_ROUTER_PROMPT = """Decide the best output format for this financial analyst answer.
+FORMAT_DIRECTIVES = {
+    "excel": (
+        "Because the user wants a data export, your answer MUST include at "
+        "least one markdown table with a header row and a separator line "
+        "(e.g. `| Metric | Q1 | Q2 | Q3 | Q4 |` then `|---|---|---|---|---|`). "
+        "Put EVERY numeric data point into the table — one metric per row, "
+        "one period/category per column. Keep prose to a 1-2 sentence intro "
+        "before the table and a brief note after. Cite sources after the "
+        "table or in a footer line."
+    ),
+    "pdf": (
+        "Because the user wants a report, structure the answer with clear "
+        "markdown headings (## Section), a short executive summary at the "
+        "top, then sections covering the key dimensions, and a closing "
+        "'Key takeaways' bullet list. Use tables where they help. Aim for "
+        "a thorough multi-section narrative."
+    ),
+    "markdown": (
+        "Keep the answer concise — a short paragraph or a small bullet "
+        "list. Use a table only if the data genuinely benefits from one."
+    ),
+}
+
+
+FORMAT_ROUTER_PROMPT = """Decide the best output format for this financial analyst question.
 
 Question: {question}
-
-Answer preview (first 800 chars):
-{preview}
 
 Choose ONE format:
 - "markdown": short factual answers, single-quarter lookups, definitions
@@ -108,6 +143,55 @@ Choose ONE format:
 - "excel": data-heavy answers, multi-row tables, time-series comparisons
 
 Respond with ONLY a JSON object like: {{"format": "markdown"}}"""
+
+
+# Strong keyword triggers — if any of these appear in the user's question,
+# we hard-route to that format regardless of the LLM's opinion.
+_EXCEL_KEYWORDS = (
+    "excel", "spreadsheet", ".xlsx", "xlsx", "csv", "table of",
+    "export", "download as a table", "downloadable table", "data dump",
+    "side-by-side", "side by side",
+)
+_PDF_KEYWORDS = (
+    "pdf", ".pdf", "report", "summary", "summarise", "summarize",
+    "executive summary", "one-pager", "one-page", "writeup", "write-up",
+    "memo", "brief",
+)
+
+
+# Patterns that indicate the LLM is refusing to "produce" a file. If we
+# see any of these in the answer, we strip them — the file IS produced,
+# by external Python code, so the refusal is incorrect and confusing.
+_REFUSAL_PATTERNS = [
+    re.compile(p, re.IGNORECASE) for p in [
+        r"(?:unfortunately,?\s+)?i (?:can(?:not|'t)|am unable to|won'?t be able to) (?:generate|create|produce|build|render|output|export|provide|attach|deliver|make) (?:a |an |the )?(?:pdf|excel|spreadsheet|xlsx|file|download|attachment|report)[^.\n]*\.?",
+        r"(?:unfortunately,?\s+)?i do(?:n'?t| not) have the (?:ability|capability|tools?|means) to (?:generate|create|produce|build|render|output|export|provide|attach|deliver|make)[^.\n]*\.?",
+        r"as an? (?:ai|language model)[^.\n]*?(?:cannot|can'?t|unable)[^.\n]*?(?:pdf|excel|file|download)[^.\n]*\.?",
+        r"(?:unfortunately,?\s+)?(?:please note(?: that)?,?\s+)?(?:i|my response) (?:can(?:not|'t)|am unable|are unable)[^.\n]*?(?:pdf|excel|file|download|attach)[^.\n]*\.?",
+    ]
+]
+
+
+def _scrub_refusals(answer: str) -> str:
+    """Remove any sentences where the LLM claims it can't make a file."""
+    cleaned = answer
+    for pat in _REFUSAL_PATTERNS:
+        cleaned = pat.sub("", cleaned)
+    # Clean up orphan prefixes / connective tissue that referred to the
+    # refusal sentence we just removed.
+    orphan_patterns = [
+        r"\bAs an? (?:AI language model|language model|AI)\s*[,.]?\s*",
+        r"\bUnfortunately\s*,?\s*(?=[A-Z])",
+        r"\bPlease note(?: that)?\s*[:,]?\s*(?=[A-Z])",
+        r"\bNote\s*:\s*(?=[A-Z])",
+    ]
+    for op in orphan_patterns:
+        cleaned = re.sub(op, "", cleaned)
+    # Collapse the empty lines / double spaces we leave behind.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 # ---------- Unified LLM caller ----------
@@ -197,12 +281,17 @@ class RagEngine:
 
     def ask(self, question: str) -> RagAnswer:
         standalone = self._rewrite_question(question)
+        # Decide format FIRST, off the original question, so we can steer
+        # the LLM toward table-shaped or report-shaped content.
+        fmt = self._preroute_format(question)
         results = self.store.search(standalone, top_k=TOP_K)
         context_block, sources = self._format_context(results)
-        answer = self._generate_answer(standalone, context_block)
-        # Route format off the *original* question — the user's "table of",
-        # "summary", "report" hints are stripped by the standalone rewriter.
-        fmt = self._route_format(question, answer)
+        answer = self._generate_answer(standalone, context_block, fmt)
+        answer = _scrub_refusals(answer)
+
+        # Light post-check: if format is "markdown" but the answer is huge
+        # or table-heavy, upgrade it so users still get a file.
+        fmt = self._maybe_upgrade_format(fmt, answer)
 
         self.history.append(ChatTurn("user", question))
         self.history.append(ChatTurn("assistant", answer))
@@ -234,14 +323,20 @@ class RagEngine:
                         "standalone": standalone,
                         "rewritten": has_history and standalone != question})
 
-        # 2. Retrieval
+        # 2. Format pre-routing — done BEFORE generation so we can steer the LLM.
+        yield ("step", {"name": "format", "status": "start"})
+        fmt = self._preroute_format(question)
+        yield ("step", {"name": "format", "status": "done", "format": fmt,
+                        "stage": "preroute"})
+
+        # 3. Retrieval
         yield ("step", {"name": "retrieve", "status": "start", "top_k": TOP_K})
         results = self.store.search(standalone, top_k=TOP_K)
         context_block, sources = self._format_context(results)
         yield ("step", {"name": "retrieve", "status": "done",
                         "count": len(results), "sources": sources})
 
-        # 3. Answer generation (streamed)
+        # 4. Answer generation (streamed) — pass format hint into the prompt
         yield ("step", {"name": "generate", "status": "start",
                         "provider": self.llm.provider,
                         "model": OLLAMA_CHAT_MODEL if self.llm.provider == "ollama" else CHAT_MODEL})
@@ -250,20 +345,23 @@ class RagEngine:
             context=context_block,
             history=self._history_text(),
             question=standalone,
+            format_hint=fmt,
+            format_directive=FORMAT_DIRECTIVES.get(fmt, FORMAT_DIRECTIVES["markdown"]),
         )
         parts: List[str] = []
         for token in self.llm.generate_stream(prompt, temperature=0.2):
             parts.append(token)
             yield ("token", {"text": token})
-        answer = "".join(parts).strip()
+        answer = _scrub_refusals("".join(parts).strip())
         yield ("step", {"name": "generate", "status": "done",
                         "length": len(answer)})
 
-        # 4. Format routing (heuristic-only here for speed; UI shows it as a step)
-        # Use the original question — the standalone rewriter strips format hints.
-        yield ("step", {"name": "format", "status": "start"})
-        fmt = self._route_format_heuristic(question, answer)
-        yield ("step", {"name": "format", "status": "done", "format": fmt})
+        # 5. Possibly upgrade format if answer shape demands it
+        new_fmt = self._maybe_upgrade_format(fmt, answer)
+        if new_fmt != fmt:
+            fmt = new_fmt
+            yield ("step", {"name": "format", "status": "done", "format": fmt,
+                            "stage": "upgrade"})
 
         # 5. Persist history
         self.history.append(ChatTurn("user", question))
@@ -320,43 +418,55 @@ class RagEngine:
                 })
         return "\n\n---\n\n".join(blocks), sources
 
-    def _generate_answer(self, standalone: str, context: str) -> str:
+    def _generate_answer(self, standalone: str, context: str, fmt: str) -> str:
         prompt = ANSWER_PROMPT.format(
             system=SYSTEM_PROMPT,
             context=context,
             history=self._history_text(),
             question=standalone,
+            format_hint=fmt,
+            format_directive=FORMAT_DIRECTIVES.get(fmt, FORMAT_DIRECTIVES["markdown"]),
         )
         return self.llm.generate(prompt, temperature=0.2)
 
-    def _route_format_heuristic(self, question: str, answer: str) -> str:
-        """Decide output format from keywords + answer shape. No extra LLM call."""
+    def _preroute_format(self, question: str) -> str:
+        """
+        Decide the output format from the QUESTION alone, before we call
+        the LLM, so we can steer the answer's shape. Excel beats PDF when
+        both keyword groups match (an explicit "excel" wins over a generic
+        "summary"). Falls back to "markdown".
+        """
         q_lower = question.lower()
-        if any(k in q_lower for k in ["report", "summary", "summarise", "summarize", "overview", "pdf"]):
-            return "pdf"
-        if any(k in q_lower for k in ["excel", "spreadsheet", "table of", "export", "download"]):
+        excel_hit = any(k in q_lower for k in _EXCEL_KEYWORDS)
+        pdf_hit = any(k in q_lower for k in _PDF_KEYWORDS)
+        if excel_hit:
             return "excel"
-        if answer.count("|") > 12 and "---" in answer:
+        if pdf_hit:
+            return "pdf"
+
+        # Question shapes that strongly imply a table even without keywords
+        table_signals = (
+            "compare", "comparison", "across all", "across each", "by quarter",
+            "quarter-over-quarter", "qoq", "yoy", "year-over-year",
+            "month by month", "per quarter", "per month", "every quarter",
+            "build a table", "give me a table", "list out",
+        )
+        if any(s in q_lower for s in table_signals):
+            return "excel"
+
+        return "markdown"
+
+    def _maybe_upgrade_format(self, current: str, answer: str) -> str:
+        """
+        Safety net for when the question didn't look special but the answer
+        came out long/tabular — promote markdown to pdf/excel so the user
+        still gets a downloadable file.
+        """
+        if current != "markdown":
+            return current
+        # Lots of pipes + a separator row = a real markdown table -> Excel
+        if answer.count("|") > 12 and re.search(r"\|\s*-{2,}", answer):
             return "excel"
         if len(answer) > 1500:
             return "pdf"
-        return "markdown"
-
-    def _route_format(self, question: str, answer: str) -> str:
-        """Heuristic format routing with an LLM tie-breaker for ambiguous cases."""
-        fmt = self._route_format_heuristic(question, answer)
-        if fmt != "markdown":
-            return fmt
-
-        prompt = FORMAT_ROUTER_PROMPT.format(question=question, preview=answer[:800])
-        try:
-            text = self.llm.generate(prompt, temperature=0.0)
-            match = re.search(r'\{.*?\}', text, re.DOTALL)
-            if match:
-                data = json.loads(match.group(0))
-                f = data.get("format", "markdown").lower()
-                if f in {"markdown", "pdf", "excel"}:
-                    return f
-        except Exception:
-            pass
-        return "markdown"
+        return current

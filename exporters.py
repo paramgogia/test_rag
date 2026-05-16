@@ -61,6 +61,51 @@ def _extract_markdown_tables(text: str) -> List[List[List[str]]]:
     return tables
 
 
+_BULLET_RE = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+(.*)$")
+# Match "Label: value", "**Label:** value", "Label — value" style lines.
+_KV_RE = re.compile(
+    r"^\s*(?:\*\*|__)?\s*([A-Za-z][A-Za-z0-9 /()&%,'\-]{1,60}?)\s*(?:\*\*|__)?\s*[:\-—]\s+(.+?)\s*$"
+)
+# A citation tag we want to peel off the value so it lands in its own column.
+_CITE_RE = re.compile(r"\[([^\[\]]+?)\]")
+
+
+def _structured_rows_from_prose(text: str) -> List[Dict[str, str]]:
+    """
+    Fallback structuring when the LLM didn't produce a markdown table.
+    Extracts (Metric, Value, Citation) rows from bullet lists and
+    'Label: value' style lines, so the Excel still gets a useful Data sheet.
+    """
+    rows: List[Dict[str, str]] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        # Skip headings and pure prose separators.
+        if line.startswith("#") or line.startswith("---"):
+            continue
+
+        body = line
+        m = _BULLET_RE.match(line)
+        if m:
+            body = m.group(1).strip()
+
+        kv = _KV_RE.match(body)
+        if not kv:
+            continue
+
+        metric = kv.group(1).strip().rstrip(":")
+        value_with_cite = kv.group(2).strip()
+
+        cites = _CITE_RE.findall(value_with_cite)
+        value = _CITE_RE.sub("", value_with_cite).strip().rstrip(",;.")
+        citation = "; ".join(cites) if cites else ""
+
+        if metric and value:
+            rows.append({"Metric": metric, "Value": value, "Citation": citation})
+    return rows
+
+
 def _strip_markdown(text: str) -> str:
     """Light markdown-to-plain conversion for PDF body. Keeps line breaks."""
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
@@ -202,11 +247,18 @@ def export_excel(question: str, answer: str, sources: List[Dict[str, Any]]) -> P
             sheet = f"Table_{i}"[:31]
             df.to_excel(writer, sheet_name=sheet, index=False)
 
-        # If no tables were found, write the answer paragraphs as a Data sheet
+        # If no tables were found, try to mine structured rows out of the
+        # answer prose (bullet lists, "Label: value" lines). Only fall back
+        # to dumping raw paragraphs if even that yields nothing.
         if not tables:
-            paragraphs = [p.strip() for p in answer.split("\n") if p.strip()]
-            df = pd.DataFrame({"Answer": paragraphs})
-            df.to_excel(writer, sheet_name="Data", index=False)
+            structured = _structured_rows_from_prose(answer)
+            if structured:
+                df = pd.DataFrame(structured)
+                df.to_excel(writer, sheet_name="Data", index=False)
+            else:
+                paragraphs = [p.strip() for p in answer.split("\n") if p.strip()]
+                df = pd.DataFrame({"Answer": paragraphs})
+                df.to_excel(writer, sheet_name="Data", index=False)
 
         # Sources sheet
         if sources:
