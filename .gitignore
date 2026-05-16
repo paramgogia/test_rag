@@ -1,0 +1,11 @@
+.env
+__pycache__/
+*.pyc
+vectorstore/*.faiss
+vectorstore/*.pkl
+outputs/*.pdf
+outputs/*.xlsx
+.venv/
+venv/
+.DS_Store
+.streamlit/secrets.toml
