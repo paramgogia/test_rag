@@ -67,6 +67,12 @@ and analyst-grade."""
 
 ANSWER_PROMPT = """{system}
 
+The text between === CONTEXT === markers below contains verbatim excerpts
+from the Infosys financial documents. Each excerpt starts with a citation
+tag in square brackets like [Q1 FY26 Press Release | Page 1]. THESE TAGS
+IDENTIFY REAL SOURCES that you DO have access to — never say the document
+"is not in the context" if a chunk from that document appears below.
+
 === CONTEXT (retrieved from the documents) ===
 {context}
 === END CONTEXT ===
@@ -76,9 +82,17 @@ Chat history (for tone and continuity, not as a source of facts):
 
 User question: {question}
 
-Write the analyst-grade answer below. Remember: cite every fact with the
-bracketed source tag. If you genuinely cannot answer from the context,
-say so plainly."""
+Instructions:
+- Quote specific numbers, percentages, and dates directly from the excerpts
+  above. Do NOT round or paraphrase numerical values.
+- End every factual statement with its source tag, e.g. "Revenue was
+  $4,941M [Q1 FY26 Press Release | Page 1]".
+- If multiple excerpts from different sources contain the answer, prefer
+  the most specific (e.g. a press release for a quarterly number).
+- Only say "the answer is not in the documents" if NO excerpt above
+  mentions the topic at all.
+
+Write the analyst-grade answer below."""
 
 
 FORMAT_ROUTER_PROMPT = """Decide the best output format for this financial analyst answer.
@@ -185,7 +199,7 @@ class RagEngine:
         standalone = self._rewrite_question(question)
         results = self.store.search(standalone, top_k=TOP_K)
         context_block, sources = self._format_context(results)
-        answer = self._generate_answer(question, standalone, context_block)
+        answer = self._generate_answer(standalone, context_block)
         fmt = self._route_format(standalone, answer)
 
         self.history.append(ChatTurn("user", question))
@@ -303,7 +317,7 @@ class RagEngine:
                 })
         return "\n\n---\n\n".join(blocks), sources
 
-    def _generate_answer(self, question: str, standalone: str, context: str) -> str:
+    def _generate_answer(self, standalone: str, context: str) -> str:
         prompt = ANSWER_PROMPT.format(
             system=SYSTEM_PROMPT,
             context=context,
