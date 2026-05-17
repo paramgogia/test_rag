@@ -1,11 +1,15 @@
-# Infosys Financial Analyst — Chatbot
+# Infosys Financial Analyst -  Chatbot
 
 A conversational analyst over seven Infosys financial documents. Ask a
 question, get an answer with citations; ask for a "side-by-side table"
 or a "one-page report" and you get a downloadable `.xlsx` or `.pdf`
 instead of just text.
 
-Built on a conversational RAG with metadata aware re-ranking and format aware response generation.
+Built on a conversational RAG with metadata aware re-ranking 
+and format aware response generation.
+
+Can run llm completely locally on your machine (16gb RAM preferred for 8B param model)
+ no dependence of external LLMs (optional)
 
 The seven sources:
 
