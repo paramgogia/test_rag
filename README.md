@@ -149,8 +149,6 @@ streamlit run app.py
 # option 2 — CLI
 python cli.py
 
-# regenerate the 6 sample conversations + PDFs/Excels
-python generate_samples.py
 ```
 
 `ingest.py` reads every file in `data/`, chunks each (2000 chars,
